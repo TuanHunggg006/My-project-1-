@@ -1,0 +1,4 @@
+PASS: exhaustive placement validation for all 32 catalog orientations and every grabbed cell/anchor.
+PASS: 18185 runtime assertions.
+PASS: catalog, scoring, empty/outside/occupied/edge placements, ghost preview, real drag/release,
+cross clear, four-line combo, intersection deduplication, animation lock, invalid return and best score.

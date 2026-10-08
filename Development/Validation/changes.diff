@@ -1,0 +1,1322 @@
+--- before/PolyominoShapeGenerator.cs
++++ after/PolyominoShapeGenerator.cs
+@@ -19,7 +19,7 @@
+     [Min(1)]
+     [SerializeField] private int suggestionsPerBatch = 3;
+     [Range(1, 6)]
+-    [SerializeField] private int maximumShapeSize = 5;
++    [SerializeField] private int maximumShapeSize = 6;
+     [SerializeField] private bool generateOnStart = true;
+ 
+     [Header("Small preview")]
+@@ -46,12 +46,21 @@
+     private float boardCellHeight;
+     private Coroutine nextBatchCoroutine;
+ 
+-    private static readonly Vector2Int[] Directions =
+-    {
+-        Vector2Int.right,
+-        Vector2Int.left,
+-        Vector2Int.up,
+-        Vector2Int.down
++    // Approved templates only. A five-cell L/P is deliberately not included.
++    // Five-cell shapes are straight bars; six-cell shapes are full rectangles.
++    private static readonly string[][] ShapeTemplates =
++    {
++        new[] { "#" },
++        new[] { "##" },
++        new[] { "###" },
++        new[] { "####" },
++        new[] { "#####" },
++        new[] { "##", "##" },
++        new[] { "###", "###" },
++        new[] { "#.", "##" },
++        new[] { "#.", "#.", "##" },
++        new[] { "###", ".#." },
++        new[] { ".##", "##." }
+     };
+ 
+     private void OnEnable()
+@@ -62,10 +71,20 @@
+                 GenerateSuggestionBatch
+             );
+         }
++
++        if (remainingSuggestions == 0 && spawnedPreviews.Count > 0 &&
++            nextBatchCoroutine == null)
++            nextBatchCoroutine = StartCoroutine(GenerateNextBatchAfterFrame());
+     }
+ 
+     private void OnDisable()
+     {
++        if (nextBatchCoroutine != null)
++            StopCoroutine(nextBatchCoroutine);
++        nextBatchCoroutine = null;
++        foreach (GameObject preview in spawnedPreviews)
++            if (preview != null && preview.TryGetComponent(out DraggableGeneratedShape shape))
++                shape.CancelInteraction();
+         if (regenerateButton != null)
+         {
+             regenerateButton.onClick.RemoveListener(
+@@ -91,6 +110,9 @@
+     public void GenerateSuggestionBatch()
+     {
+         if (!ValidateReferences())
++            return;
++
++        if (dropBoard.IsClearingLines || HasActivePreviewDrag())
+             return;
+ 
+         dropBoard.InitializeBoard();
+@@ -224,55 +246,53 @@
+     private List<HashSet<Vector2Int>> BuildAllShapes(
+         int cellCount)
+     {
+-        List<HashSet<Vector2Int>> currentShapes =
+-            new List<HashSet<Vector2Int>>
++        Dictionary<string, HashSet<Vector2Int>> uniqueShapes =
++            new Dictionary<string, HashSet<Vector2Int>>();
++
++        foreach (string[] template in ShapeTemplates)
++        {
++            List<Vector2Int> templateCells = new List<Vector2Int>();
++            for (int y = 0; y < template.Length; y++)
++                for (int x = 0; x < template[y].Length; x++)
++                    if (template[y][x] == '#')
++                        templateCells.Add(new Vector2Int(x, y));
++
++            if (templateCells.Count != cellCount)
++                continue;
++
++            for (int mirror = 0; mirror < 2; mirror++)
+             {
+-                new HashSet<Vector2Int>
++                for (int rotation = 0; rotation < 4; rotation++)
+                 {
+-                    Vector2Int.zero
+-                }
+-            };
+-
+-        for (int currentSize = 2;
+-             currentSize <= cellCount;
+-             currentSize++)
+-        {
+-            Dictionary<string, HashSet<Vector2Int>> uniqueShapes =
+-                new Dictionary<string, HashSet<Vector2Int>>();
+-
+-            foreach (HashSet<Vector2Int> shape in currentShapes)
+-            {
+-                foreach (Vector2Int cell in shape)
+-                {
+-                    foreach (Vector2Int direction in Directions)
++                    HashSet<Vector2Int> candidate = new HashSet<Vector2Int>();
++                    foreach (Vector2Int cell in templateCells)
+                     {
+-                        Vector2Int newCell = cell + direction;
+-
+-                        if (shape.Contains(newCell))
+-                            continue;
+-
+-                        HashSet<Vector2Int> candidate =
+-                            new HashSet<Vector2Int>(shape)
+-                            {
+-                                newCell
+-                            };
+-
+-                        candidate = Normalize(candidate);
+-                        string key = BuildKey(candidate);
+-
+-                        if (!uniqueShapes.ContainsKey(key))
+-                            uniqueShapes.Add(key, candidate);
++                        Vector2Int transformed = new Vector2Int(
++                            mirror == 0 ? cell.x : -cell.x, cell.y);
++                        for (int turn = 0; turn < rotation; turn++)
++                            transformed = new Vector2Int(-transformed.y, transformed.x);
++                        candidate.Add(transformed);
+                     }
++
++                    candidate = Normalize(candidate);
++                    string key = BuildKey(candidate);
++                    if (!uniqueShapes.ContainsKey(key))
++                        uniqueShapes.Add(key, candidate);
+                 }
+             }
+-
+-            currentShapes =
+-                new List<HashSet<Vector2Int>>(
+-                    uniqueShapes.Values
+-                );
+-        }
+-
+-        return currentShapes;
++        }
++
++        return new List<HashSet<Vector2Int>>(uniqueShapes.Values);
++    }
++
++    private bool HasActivePreviewDrag()
++    {
++        foreach (GameObject preview in spawnedPreviews)
++            if (preview != null &&
++                preview.TryGetComponent(out DraggableGeneratedShape shape) &&
++                shape.IsInteracting)
++                return true;
++        return false;
+     }
+ 
+     private bool CreateShapePreview(
+--- before/DraggableGeneratedShape.cs
++++ after/DraggableGeneratedShape.cs
+@@ -1,3 +1,4 @@
++using System.Collections;
+ using System.Collections.Generic;
+ using UnityEngine;
+ using UnityEngine.EventSystems;
+@@ -10,72 +11,73 @@
+         public RectTransform RectTransform { get; }
+         public Vector2Int Coordinate { get; }
+ 
+-        public CellData(
+-            RectTransform rectTransform,
+-            Vector2Int coordinate)
++        public CellData(RectTransform rectTransform, Vector2Int coordinate)
+         {
+             RectTransform = rectTransform;
+             Coordinate = coordinate;
+         }
+     }
+ 
++    [Header("Drag feel")]
++    [SerializeField, Min(1f)] private float followSpeed = 32f;
++    [SerializeField, Range(0f, 1f)] private float magnetStrength = 0.8f;
++    [SerializeField, Min(0.01f)] private float pickupDuration = 0.1f;
++    [SerializeField, Min(0.01f)] private float returnDuration = 0.18f;
++
+     public IReadOnlyList<CellData> Cells => cells;
+-
+-    private readonly List<CellData> cells =
+-        new List<CellData>();
+-
++    public bool IsInteracting => isDragging || isReturning || scrollLocked;
++    private readonly List<CellData> cells = new List<CellData>();
++    private readonly List<int> previewTargets = new List<int>();
+     private GridDropBoard dropBoard;
+     private PolyominoShapeGenerator suggestionGenerator;
+     private RectTransform shapeRect;
+-    private Canvas rootCanvas;
++    private RectTransform canvasRect;
+     private CanvasGroup canvasGroup;
+     private ScrollRect parentScrollRect;
+-
+     private Transform originalParent;
+     private int originalSiblingIndex;
+     private Vector2 originalAnchoredPosition;
+     private Vector3 originalLocalScale;
+     private Quaternion originalLocalRotation;
++    private Vector3 pickupStartScale;
++    private Vector3 dragScale;
+     private Vector2Int grabbedCell;
++    private RectTransform grabbedRect;
++    private Vector2 pointerPosition;
++    private Camera eventCamera;
++    private float pickupElapsed;
++    private int pointerId;
+     private bool isDragging;
++    private bool isReturning;
+     private bool scrollLocked;
+     private bool scrollWasEnabled;
+-
+-    public void Initialize(
+-        GridDropBoard board,
+-        PolyominoShapeGenerator generator)
++    private Coroutine returnCoroutine;
++
++    public void Initialize(GridDropBoard board, PolyominoShapeGenerator generator)
+     {
+         dropBoard = board;
+         suggestionGenerator = generator;
+         shapeRect = GetComponent<RectTransform>();
+         canvasGroup = GetComponent<CanvasGroup>();
+-
+         if (canvasGroup == null)
+             canvasGroup = gameObject.AddComponent<CanvasGroup>();
+     }
+ 
+-    public void RegisterCell(
+-        RectTransform cellRect,
+-        Vector2Int coordinate)
++    public void RegisterCell(RectTransform cellRect, Vector2Int coordinate)
+     {
+         cells.Add(new CellData(cellRect, coordinate));
+     }
+ 
+     public void PrepareForPotentialDrag()
+     {
+-        if (scrollLocked)
+-            return;
+-
++        if (scrollLocked || isReturning || dropBoard == null || dropBoard.IsClearingLines)
++            return;
+         if (parentScrollRect == null)
+-        {
+-            parentScrollRect =
+-                GetComponentInParent<ScrollRect>();
+-        }
+-
++            parentScrollRect = GetComponentInParent<ScrollRect>();
+         if (parentScrollRect == null)
+             return;
+-
+         scrollWasEnabled = parentScrollRect.enabled;
++        parentScrollRect.StopMovement();
+         parentScrollRect.enabled = false;
+         scrollLocked = true;
+     }
+@@ -88,147 +90,144 @@
+ 
+     public void BeginDrag(PointerEventData eventData)
+     {
+-        if (isDragging || dropBoard == null || cells.Count == 0)
+-            return;
+-
+-        if (shapeRect == null)
+-            shapeRect = GetComponent<RectTransform>();
+-
+-        rootCanvas = GetComponentInParent<Canvas>();
+-
+-        if (rootCanvas == null)
+-            return;
+-
+-        rootCanvas = rootCanvas.rootCanvas;
++        if (isDragging || isReturning || dropBoard == null ||
++            dropBoard.IsClearingLines || cells.Count == 0 || !dropBoard.TryBeginDrag(this))
++        {
++            RestoreParentScroll();
++            return;
++        }
++
++        Canvas canvas = GetComponentInParent<Canvas>();
++        if (canvas == null)
++        {
++            dropBoard.EndDragPreview(this);
++            RestoreParentScroll();
++            return;
++        }
++        canvasRect = canvas.rootCanvas.transform as RectTransform;
++        eventCamera = canvas.rootCanvas.renderMode == RenderMode.ScreenSpaceOverlay
++            ? null : (eventData.pressEventCamera != null ? eventData.pressEventCamera : canvas.rootCanvas.worldCamera);
++        pointerId = eventData.pointerId;
++        pointerPosition = eventData.position;
+         originalParent = shapeRect.parent;
+         originalSiblingIndex = shapeRect.GetSiblingIndex();
+         originalAnchoredPosition = shapeRect.anchoredPosition;
+         originalLocalScale = shapeRect.localScale;
+         originalLocalRotation = shapeRect.localRotation;
+-
+-        grabbedCell = FindClosestCell(
+-            eventData.position,
+-            eventData.pressEventCamera
+-        );
+-
++        grabbedRect = FindClosestCell(pointerPosition, eventCamera, out grabbedCell);
+         PrepareForPotentialDrag();
+-
+-        shapeRect.SetParent(rootCanvas.transform, true);
++        shapeRect.SetParent(canvasRect, true);
+         shapeRect.SetAsLastSibling();
+-
+-        // Ở khay shape nhỏ; khi kéo thì phóng đúng cỡ ô Grid.
+-        shapeRect.localScale = Vector3.one;
+-        MoveGrabbedCellToPointer(eventData);
+-
++        pickupStartScale = shapeRect.localScale;
++        dragScale = dropBoard.GetDragScale(canvasRect);
++        pickupElapsed = 0f;
+         canvasGroup.blocksRaycasts = false;
+         isDragging = true;
+     }
+ 
+     public void Drag(PointerEventData eventData)
+     {
+-        if (!isDragging || rootCanvas == null)
+-            return;
+-
+-        shapeRect.anchoredPosition +=
+-            eventData.delta / rootCanvas.scaleFactor;
++        if (isDragging && eventData.pointerId == pointerId)
++            pointerPosition = eventData.position;
++    }
++
++    private void LateUpdate()
++    {
++        if (!isDragging || canvasRect == null || grabbedRect == null)
++            return;
++        pickupElapsed += Time.unscaledDeltaTime;
++        float pickup = Mathf.Clamp01(pickupElapsed / Mathf.Max(0.01f, pickupDuration));
++        shapeRect.localScale = Vector3.Lerp(pickupStartScale, dragScale, 1f - Mathf.Pow(1f - pickup, 3f));
++        if (!RectTransformUtility.ScreenPointToWorldPointInRectangle(
++                canvasRect, pointerPosition, eventCamera, out Vector3 pointerWorld))
++            return;
++
++        Vector3 desiredCenter = pointerWorld;
++        if (dropBoard.TryGetPlacement(this, grabbedCell, pointerPosition, eventCamera,
++                previewTargets, out Vector3 snapCenter))
++        {
++            desiredCenter = Vector3.Lerp(pointerWorld, snapCenter, magnetStrength);
++            dropBoard.ShowPlacementPreview(this, previewTargets);
++        }
++        else
++            dropBoard.HidePlacementPreview(this);
++
++        Vector3 grabbedWorld = grabbedRect.TransformPoint(grabbedRect.rect.center);
++        Vector3 targetPosition = shapeRect.position + desiredCenter - grabbedWorld;
++        float follow = 1f - Mathf.Exp(-followSpeed * Time.unscaledDeltaTime);
++        shapeRect.position = Vector3.Lerp(shapeRect.position, targetPosition, follow);
+     }
+ 
+     public void EndDrag(PointerEventData eventData)
+     {
+-        if (!isDragging)
+-            return;
+-
++        if (!isDragging || eventData.pointerId != pointerId)
++            return;
+         isDragging = false;
+-        canvasGroup.blocksRaycasts = true;
+-
++        dropBoard.EndDragPreview(this);
+         RestoreParentScroll();
+-
+-        bool placed = dropBoard.TryPlaceShape(
+-            this,
+-            grabbedCell,
+-            eventData.position,
+-            eventData.pressEventCamera
+-        );
+-
++        bool placed = dropBoard.TryPlaceShape(this, grabbedCell, eventData.position, eventCamera);
+         if (!placed)
+         {
+-            ReturnToPreview();
+-            return;
+-        }
+-
++            returnCoroutine = StartCoroutine(ReturnToPreview());
++            return;
++        }
+         if (suggestionGenerator != null)
+             suggestionGenerator.NotifySuggestionPlaced();
+     }
+ 
+-    private void MoveGrabbedCellToPointer(
+-        PointerEventData eventData)
+-    {
+-        RectTransform grabbedRect = null;
+-
++    private RectTransform FindClosestCell(Vector2 screenPosition, Camera camera, out Vector2Int coordinate)
++    {
++        float closestDistance = float.MaxValue;
++        RectTransform closest = null;
++        coordinate = Vector2Int.zero;
+         foreach (CellData cell in cells)
+         {
+-            if (cell.Coordinate == grabbedCell)
+-            {
+-                grabbedRect = cell.RectTransform;
+-                break;
+-            }
+-        }
+-
+-        if (grabbedRect == null)
+-            return;
+-
+-        Vector3 worldCenter = grabbedRect.TransformPoint(
+-            grabbedRect.rect.center
+-        );
+-
+-        Vector2 cellScreenCenter =
+-            RectTransformUtility.WorldToScreenPoint(
+-                eventData.pressEventCamera,
+-                worldCenter
+-            );
+-
+-        Vector2 screenDelta =
+-            eventData.position - cellScreenCenter;
+-
+-        shapeRect.anchoredPosition +=
+-            screenDelta / rootCanvas.scaleFactor;
+-    }
+-
+-    private Vector2Int FindClosestCell(
+-        Vector2 screenPosition,
+-        Camera eventCamera)
+-    {
+-        float closestDistance = float.MaxValue;
+-        Vector2Int closestCoordinate = Vector2Int.zero;
+-
+-        foreach (CellData cell in cells)
+-        {
+-            Vector3 worldCenter =
+-                cell.RectTransform.TransformPoint(
+-                    cell.RectTransform.rect.center
+-                );
+-
+-            Vector2 screenCenter =
+-                RectTransformUtility.WorldToScreenPoint(
+-                    eventCamera,
+-                    worldCenter
+-                );
+-
+-            float distance =
+-                (screenCenter - screenPosition).sqrMagnitude;
+-
++            Vector2 center = RectTransformUtility.WorldToScreenPoint(camera,
++                cell.RectTransform.TransformPoint(cell.RectTransform.rect.center));
++            float distance = (center - screenPosition).sqrMagnitude;
+             if (distance >= closestDistance)
+                 continue;
+-
+             closestDistance = distance;
+-            closestCoordinate = cell.Coordinate;
+-        }
+-
+-        return closestCoordinate;
+-    }
+-
+-    private void ReturnToPreview()
+-    {
++            coordinate = cell.Coordinate;
++            closest = cell.RectTransform;
++        }
++        return closest;
++    }
++
++    private IEnumerator ReturnToPreview()
++    {
++        isReturning = true;
++        canvasGroup.blocksRaycasts = false;
++        Vector3 startPosition = shapeRect.position;
++        Vector3 startScale = shapeRect.localScale;
++        shapeRect.SetParent(originalParent, false);
++        shapeRect.anchoredPosition = originalAnchoredPosition;
++        shapeRect.localScale = originalLocalScale;
++        Vector3 targetPosition = shapeRect.position;
++        shapeRect.SetParent(canvasRect, true);
++        Vector3 targetScale = shapeRect.localScale;
++        shapeRect.position = startPosition;
++        shapeRect.localScale = startScale;
++        float elapsed = 0f;
++        while (elapsed < returnDuration)
++        {
++            elapsed += Time.unscaledDeltaTime;
++            float t = Mathf.Clamp01(elapsed / Mathf.Max(0.01f, returnDuration));
++            float ease = 1f - Mathf.Pow(1f - t, 3f);
++            shapeRect.position = Vector3.Lerp(startPosition, targetPosition, ease);
++            shapeRect.localScale = Vector3.Lerp(startScale, targetScale, ease);
++            yield return null;
++        }
++        RestorePreviewTransform();
++        canvasGroup.blocksRaycasts = true;
++        isReturning = false;
++        returnCoroutine = null;
++    }
++
++    private void RestorePreviewTransform()
++    {
++        if (originalParent == null)
++            return;
+         shapeRect.SetParent(originalParent, false);
+         shapeRect.SetSiblingIndex(originalSiblingIndex);
+         shapeRect.anchoredPosition = originalAnchoredPosition;
+@@ -240,12 +239,29 @@
+     {
+         if (parentScrollRect != null && scrollLocked)
+             parentScrollRect.enabled = scrollWasEnabled;
+-
+         scrollLocked = false;
+     }
+ 
++    public void CancelInteraction()
++    {
++        if (dropBoard != null)
++            dropBoard.EndDragPreview(this);
++        if (isDragging || isReturning)
++        {
++            if (returnCoroutine != null)
++                StopCoroutine(returnCoroutine);
++            RestorePreviewTransform();
++            if (canvasGroup != null)
++                canvasGroup.blocksRaycasts = true;
++        }
++        isDragging = false;
++        isReturning = false;
++        returnCoroutine = null;
++        RestoreParentScroll();
++    }
++
+     private void OnDisable()
+     {
+-        RestoreParentScroll();
++        CancelInteraction();
+     }
+ }
+--- before/GridDropBoard.cs
++++ after/GridDropBoard.cs
+@@ -33,19 +33,46 @@
+     [Range(0f, 1f)]
+     [SerializeField] private float clearFlashStrength = 0.75f;
+ 
++    [Header("Placement")]
++    [SerializeField, Min(0.01f)] private float placementDuration = 0.12f;
++    [SerializeField, Range(0.1f, 0.8f)] private float previewAlpha = 0.35f;
++
++    [Header("Score")]
++    [SerializeField, Min(1)] private int pointsPerLine = 100;
++    [SerializeField] private BlockPuzzleScoreDisplay scoreDisplay;
++    [SerializeField] private string bestScoreKey = "BlockPuzzle.BestScore";
++
++    [Header("Line glow")]
++    [SerializeField] private Color lineGlowColor = new Color(0.6f, 0.85f, 1f, 1f);
++    [SerializeField, Min(0.01f)] private float lineFlashDuration = 0.18f;
++
+     private RectTransform[] gridCells;
+     private bool[] occupiedCells;
+     private RectTransform[] placedBlocks;
+     private bool boardInitialized;
+     private bool initialBlocksCreated;
+     private int activeClearAnimations;
+-
+-    public bool IsClearingLines => activeClearAnimations > 0;
++    private int activePlacementAnimations;
++    private bool scoreInitialized;
++    private readonly List<Image> previewImages = new List<Image>();
++    private readonly List<int> placementTargets = new List<int>();
++    private readonly List<RectTransform> clearingBlocks = new List<RectTransform>();
++    private readonly List<RectTransform> glowVisuals = new List<RectTransform>();
++    private DraggableGeneratedShape previewOwner;
++    private Coroutine resolutionCoroutine;
++    private Sprite glowSprite;
++    private Texture2D glowTexture;
++
++    public int Score { get; private set; }
++    public int BestScore { get; private set; }
++
++    public bool IsClearingLines => activeClearAnimations > 0 || activePlacementAnimations > 0;
+ 
+     private IEnumerator Start()
+     {
+         yield return null;
+         InitializeBoard();
++        EnsureScoreDisplay();
+     }
+ 
+     public void InitializeBoard()
+@@ -58,7 +85,7 @@
+             gridCells != null &&
+             gridCells.Length == rows * columns &&
+             gridCells.Length > 0 &&
+-            gridCells[0] != null;
++            Array.TrueForAll(gridCells, cell => cell != null);
+ 
+         if (!boardInitialized || initialBlocksCreated)
+             return;
+@@ -93,6 +120,8 @@
+ 
+         List<Vector2Int> cells =
+             new List<Vector2Int>(shapeCells);
++        if (cells.Count == 0)
++            return false;
+ 
+         for (int anchorRow = 0;
+              anchorRow < rows;
+@@ -121,7 +150,7 @@
+                     int targetIndex =
+                         targetRow * columns + targetColumn;
+ 
+-                    if (occupiedCells[targetIndex])
++                    if (gridCells[targetIndex] == null || occupiedCells[targetIndex])
+                     {
+                         fits = false;
+                         break;
+@@ -142,12 +171,43 @@
+         Vector2 pointerScreenPosition,
+         Camera eventCamera)
+     {
+-        if (shape == null ||
+-            IsClearingLines ||
+-            !EnsureGridReady())
+-        {
++        if (!TryGetPlacement(shape, grabbedCell, pointerScreenPosition,
++                eventCamera, placementTargets, out _))
+             return false;
+-        }
++
++        EndDragPreview(shape);
++        for (int i = 0; i < shape.Cells.Count; i++)
++        {
++            int targetIndex = placementTargets[i];
++            occupiedCells[targetIndex] = true;
++            RectTransform block = shape.Cells[i].RectTransform;
++            Vector3 startCenter = block.TransformPoint(block.rect.center);
++            Vector3 startScale = block.lossyScale;
++            PlaceCellVisual(block, gridCells[targetIndex], targetIndex);
++            placedBlocks[targetIndex] = block;
++            Vector3 targetPosition = block.localPosition;
++            block.position = startCenter;
++            Vector3 parentScale = placedBlocksRoot.lossyScale;
++            block.localScale = new Vector3(startScale.x / parentScale.x,
++                startScale.y / parentScale.y, 1f);
++            activePlacementAnimations++;
++            StartCoroutine(PlayPlacementEffect(block, targetPosition));
++        }
++
++        resolutionCoroutine = StartCoroutine(ResolvePlacement());
++        Destroy(shape.gameObject);
++        return true;
++    }
++
++    // Preview and release share the same validation, including boundaries and occupancy.
++    public bool TryGetPlacement(DraggableGeneratedShape shape, Vector2Int grabbedCell,
++        Vector2 pointerScreenPosition, Camera eventCamera, List<int> targetIndices,
++        out Vector3 snappedCenter)
++    {
++        snappedCenter = Vector3.zero;
++        targetIndices.Clear();
++        if (shape == null || shape.Cells.Count == 0 || IsClearingLines || !EnsureGridReady())
++            return false;
+ 
+         if (!RectTransformUtility.RectangleContainsScreenPoint(
+                 gridContainer,
+@@ -167,7 +227,7 @@
+ 
+         int anchorRow = anchorIndex / columns;
+         int anchorColumn = anchorIndex % columns;
+-        List<int> targetIndices = new List<int>();
++        snappedCenter = gridCells[anchorIndex].TransformPoint(gridCells[anchorIndex].rect.center);
+ 
+         foreach (DraggableGeneratedShape.CellData cell
+                  in shape.Cells)
+@@ -191,8 +251,8 @@
+             int targetIndex =
+                 targetRow * columns + targetColumn;
+ 
+-            if (gridCells[targetIndex] == null ||
+-                occupiedCells[targetIndex])
++            if (cell.RectTransform == null || gridCells[targetIndex] == null ||
++                occupiedCells[targetIndex] || targetIndices.Contains(targetIndex))
+             {
+                 return false;
+             }
+@@ -200,152 +260,227 @@
+             targetIndices.Add(targetIndex);
+         }
+ 
+-        for (int i = 0; i < shape.Cells.Count; i++)
+-        {
+-            int targetIndex = targetIndices[i];
++        return true;
++    }
++
++    public Vector3 GetDragScale(RectTransform dragParent)
++    {
++        Vector3 boardScale = gridContainer.lossyScale;
++        Vector3 parentScale = dragParent.lossyScale;
++        return new Vector3(boardScale.x / parentScale.x, boardScale.y / parentScale.y, 1f);
++    }
++
++    public bool TryBeginDrag(DraggableGeneratedShape shape)
++    {
++        if (IsClearingLines || (previewOwner != null && previewOwner != shape))
++            return false;
++        previewOwner = shape;
++        return true;
++    }
++
++    public void ShowPlacementPreview(DraggableGeneratedShape shape, List<int> targets)
++    {
++        if (previewOwner != shape)
++            return;
++        while (previewImages.Count < targets.Count)
++        {
++            GameObject visual = new GameObject("PlacementGhost", typeof(RectTransform), typeof(Image));
++            visual.transform.SetParent(placedBlocksRoot, false);
++            Image image = visual.GetComponent<Image>();
++            image.raycastTarget = false;
++            previewImages.Add(image);
++        }
++        for (int i = 0; i < previewImages.Count; i++)
++        {
++            Image ghost = previewImages[i];
++            ghost.gameObject.SetActive(i < targets.Count);
++            if (i >= targets.Count)
++                continue;
++            Image source = shape.Cells[i].RectTransform.GetComponent<Image>();
++            ghost.sprite = source != null ? source.sprite : null;
++            Color color = source != null ? source.color : Color.white;
++            color.a = previewAlpha;
++            ghost.color = color;
++            ghost.rectTransform.sizeDelta = gridCells[targets[i]].rect.size;
++            ghost.rectTransform.position = gridCells[targets[i]].TransformPoint(gridCells[targets[i]].rect.center);
++            ghost.transform.SetAsLastSibling();
++        }
++    }
++
++    public void HidePlacementPreview(DraggableGeneratedShape shape)
++    {
++        if (previewOwner != shape)
++            return;
++        foreach (Image ghost in previewImages)
++            if (ghost != null)
++                ghost.gameObject.SetActive(false);
++    }
++
++    public void EndDragPreview(DraggableGeneratedShape shape)
++    {
++        HidePlacementPreview(shape);
++        if (previewOwner == shape)
++            previewOwner = null;
++    }
++
++    private IEnumerator PlayPlacementEffect(RectTransform block, Vector3 targetPosition)
++    {
++        Vector3 startPosition = block.localPosition;
++        Vector3 startScale = block.localScale;
++        float elapsed = 0f;
++        float duration = Mathf.Max(0.01f, placementDuration);
++        while (block != null && elapsed < duration)
++        {
++            elapsed += Time.unscaledDeltaTime;
++            float t = Mathf.Clamp01(elapsed / duration);
++            float ease = 1f - Mathf.Pow(1f - t, 3f);
++            block.localPosition = Vector3.Lerp(startPosition, targetPosition, ease);
++            block.localScale = Vector3.Lerp(startScale, Vector3.one, ease) *
++                (1f + Mathf.Sin(t * Mathf.PI) * 0.045f);
++            yield return null;
++        }
++        if (block != null)
++        {
++            block.localPosition = targetPosition;
++            block.localScale = Vector3.one;
++        }
++        activePlacementAnimations = Mathf.Max(0, activePlacementAnimations - 1);
++    }
++
++    private IEnumerator ResolvePlacement()
++    {
++        while (activePlacementAnimations > 0)
++            yield return null;
++        ClearCompletedRowsAndColumns();
++        while (activeClearAnimations > 0)
++            yield return null;
++        resolutionCoroutine = null;
++    }
++
++    [ContextMenu("Refresh Grid Cells")]
++    public void RefreshGridCells()
++    {
++        if (gridContainer == null)
++            gridContainer = GetComponent<RectTransform>();
++
++        if (placedBlocksRoot == null)
++            placedBlocksRoot = gridContainer;
++
++        int cellCount = rows * columns;
++        gridCells = new RectTransform[cellCount];
++
++        if (occupiedCells == null ||
++            occupiedCells.Length != cellCount)
++        {
++            occupiedCells = new bool[cellCount];
++            placedBlocks = new RectTransform[cellCount];
++        }
++        else if (placedBlocks == null ||
++                 placedBlocks.Length != cellCount)
++        {
++            placedBlocks = new RectTransform[cellCount];
++        }
++
++        for (int i = 0; i < gridContainer.childCount; i++)
++        {
++            Transform child = gridContainer.GetChild(i);
++
++            if (!child.name.StartsWith(
++                    "Square_",
++                    StringComparison.Ordinal))
++            {
++                continue;
++            }
++
++            string indexText =
++                child.name.Substring("Square_".Length);
++
++            if (!int.TryParse(indexText, out int index))
++                continue;
++
++            if (index < 0 || index >= gridCells.Length)
++                continue;
++
++            gridCells[index] = child as RectTransform;
++        }
++    }
++
++    private void SpawnInitialRandomBlocks()
++    {
++        if (blockPalette == null ||
++            !blockPalette.HasValidPrefab)
++        {
++            Debug.LogWarning(
++                "Không tạo ô ban đầu vì Block Palette đang trống."
++            );
++            return;
++        }
++
++        int minimum = Mathf.Clamp(
++            minimumInitialBlocks,
++            0,
++            occupiedCells.Length
++        );
++
++        int maximum = Mathf.Clamp(
++            maximumInitialBlocks,
++            minimum,
++            occupiedCells.Length
++        );
++
++        int blockCount = UnityEngine.Random.Range(
++            minimum,
++            maximum + 1
++        );
++
++        List<int> freeIndices = new List<int>();
++
++        for (int i = 0; i < occupiedCells.Length; i++)
++        {
++            if (!occupiedCells[i] && gridCells[i] != null)
++                freeIndices.Add(i);
++        }
++
++        for (int i = 0;
++             i < blockCount && freeIndices.Count > 0;
++             i++)
++        {
++            int listIndex = UnityEngine.Random.Range(
++                0,
++                freeIndices.Count
++            );
++
++            int targetIndex = freeIndices[listIndex];
++            freeIndices.RemoveAt(listIndex);
++
++            GameObject prefab = blockPalette.GetRandomPrefab();
++
++            if (prefab == null)
++                continue;
++
++            GameObject blockObject = Instantiate(
++                prefab,
++                placedBlocksRoot,
++                false
++            );
++
++            RectTransform block =
++                blockObject.GetComponent<RectTransform>();
++
++            if (block == null)
++            {
++                Destroy(blockObject);
++                continue;
++            }
++
+             occupiedCells[targetIndex] = true;
+-
+-            RectTransform block =
+-                shape.Cells[i].RectTransform;
++            placedBlocks[targetIndex] = block;
+ 
+             PlaceCellVisual(
+                 block,
+                 gridCells[targetIndex],
+                 targetIndex
+             );
+-
+-            placedBlocks[targetIndex] = block;
+-        }
+-
+-        ClearCompletedRowsAndColumns();
+-        Destroy(shape.gameObject);
+-        return true;
+-    }
+-
+-    [ContextMenu("Refresh Grid Cells")]
+-    public void RefreshGridCells()
+-    {
+-        if (gridContainer == null)
+-            gridContainer = GetComponent<RectTransform>();
+-
+-        if (placedBlocksRoot == null)
+-            placedBlocksRoot = gridContainer;
+-
+-        int cellCount = rows * columns;
+-        gridCells = new RectTransform[cellCount];
+-
+-        if (occupiedCells == null ||
+-            occupiedCells.Length != cellCount)
+-        {
+-            occupiedCells = new bool[cellCount];
+-            placedBlocks = new RectTransform[cellCount];
+-        }
+-        else if (placedBlocks == null ||
+-                 placedBlocks.Length != cellCount)
+-        {
+-            placedBlocks = new RectTransform[cellCount];
+-        }
+-
+-        for (int i = 0; i < gridContainer.childCount; i++)
+-        {
+-            Transform child = gridContainer.GetChild(i);
+-
+-            if (!child.name.StartsWith(
+-                    "Square_",
+-                    StringComparison.Ordinal))
+-            {
+-                continue;
+-            }
+-
+-            string indexText =
+-                child.name.Substring("Square_".Length);
+-
+-            if (!int.TryParse(indexText, out int index))
+-                continue;
+-
+-            if (index < 0 || index >= gridCells.Length)
+-                continue;
+-
+-            gridCells[index] = child as RectTransform;
+-        }
+-    }
+-
+-    private void SpawnInitialRandomBlocks()
+-    {
+-        if (blockPalette == null ||
+-            !blockPalette.HasValidPrefab)
+-        {
+-            Debug.LogWarning(
+-                "Không tạo ô ban đầu vì Block Palette đang trống."
+-            );
+-            return;
+-        }
+-
+-        int minimum = Mathf.Clamp(
+-            minimumInitialBlocks,
+-            0,
+-            occupiedCells.Length
+-        );
+-
+-        int maximum = Mathf.Clamp(
+-            maximumInitialBlocks,
+-            minimum,
+-            occupiedCells.Length
+-        );
+-
+-        int blockCount = UnityEngine.Random.Range(
+-            minimum,
+-            maximum + 1
+-        );
+-
+-        List<int> freeIndices = new List<int>();
+-
+-        for (int i = 0; i < occupiedCells.Length; i++)
+-        {
+-            if (!occupiedCells[i] && gridCells[i] != null)
+-                freeIndices.Add(i);
+-        }
+-
+-        for (int i = 0;
+-             i < blockCount && freeIndices.Count > 0;
+-             i++)
+-        {
+-            int listIndex = UnityEngine.Random.Range(
+-                0,
+-                freeIndices.Count
+-            );
+-
+-            int targetIndex = freeIndices[listIndex];
+-            freeIndices.RemoveAt(listIndex);
+-
+-            GameObject prefab = blockPalette.GetRandomPrefab();
+-
+-            if (prefab == null)
+-                continue;
+-
+-            GameObject blockObject = Instantiate(
+-                prefab,
+-                placedBlocksRoot,
+-                false
+-            );
+-
+-            RectTransform block =
+-                blockObject.GetComponent<RectTransform>();
+-
+-            if (block == null)
+-            {
+-                Destroy(blockObject);
+-                continue;
+-            }
+-
+-            occupiedCells[targetIndex] = true;
+-            placedBlocks[targetIndex] = block;
+-
+-            PlaceCellVisual(
+-                block,
+-                gridCells[targetIndex],
+-                targetIndex
+-            );
+         }
+     }
+ 
+@@ -407,6 +542,24 @@
+             }
+         }
+ 
++        if (indicesToClear.Count == 0)
++            return;
++
++        EnsureScoreDisplay();
++        int multiplier = CalculateLineMultiplier(fullRows.Count, fullColumns.Count);
++        int gained = CalculateLineScore(fullRows.Count, fullColumns.Count, pointsPerLine);
++        Score = (int)Math.Min(int.MaxValue, (long)Score + gained);
++        if (Score > BestScore)
++        {
++            BestScore = Score;
++            PlayerPrefs.SetInt(bestScoreKey, BestScore);
++            PlayerPrefs.Save();
++        }
++        Vector3 scorePosition = Vector3.zero;
++        foreach (int index in indicesToClear)
++            scorePosition += gridCells[index].TransformPoint(gridCells[index].rect.center);
++        scorePosition /= indicesToClear.Count;
++        scoreDisplay.AnimateAward(Score, BestScore, gained, multiplier, scorePosition);
+         foreach (int index in indicesToClear)
+         {
+             occupiedCells[index] = false;
+@@ -422,6 +575,7 @@
+                 );
+ 
+                 activeClearAnimations++;
++                clearingBlocks.Add(block);
+                 StartCoroutine(
+                     PlayClearEffect(block, delay)
+                 );
+@@ -429,6 +583,124 @@
+ 
+             placedBlocks[index] = null;
+         }
++        foreach (int row in fullRows)
++            StartLineGlow(row * columns, row * columns + columns - 1, true);
++        foreach (int column in fullColumns)
++            StartLineGlow(column, (rows - 1) * columns + column, false);
++    }
++
++    // Multipliers apply to all completed lines in this single placement.
++    public static int CalculateLineMultiplier(int rowCount, int columnCount)
++    {
++        int total = Mathf.Max(0, rowCount) + Mathf.Max(0, columnCount);
++        return total == 0 ? 0 : 1 + total / 2;
++    }
++
++    public static int CalculateLineScore(int rowCount, int columnCount, int basePoints = 100)
++    {
++        int total = Mathf.Max(0, rowCount) + Mathf.Max(0, columnCount);
++        return (int)Math.Min(int.MaxValue, (long)total * Mathf.Max(0, basePoints) *
++            CalculateLineMultiplier(rowCount, columnCount));
++    }
++
++    private void EnsureScoreDisplay()
++    {
++        if (scoreInitialized || gridContainer == null)
++            return;
++        BestScore = PlayerPrefs.GetInt(bestScoreKey, 0);
++        if (scoreDisplay == null)
++        {
++            GameObject hud = new GameObject("ScoreDisplay", typeof(RectTransform));
++            hud.transform.SetParent(gridContainer.parent, false);
++            scoreDisplay = hud.AddComponent<BlockPuzzleScoreDisplay>();
++        }
++        scoreDisplay.Initialize(gridContainer, GetGlowSprite(), Score, BestScore);
++        scoreInitialized = true;
++    }
++
++    private Sprite GetGlowSprite()
++    {
++        if (glowSprite != null)
++            return glowSprite;
++        const int size = 64;
++        glowTexture = new Texture2D(size, size, TextureFormat.RGBA32, false);
++        glowTexture.name = "RuntimeLineGlow";
++        glowTexture.wrapMode = TextureWrapMode.Clamp;
++        Color[] pixels = new Color[size * size];
++        for (int y = 0; y < size; y++)
++            for (int x = 0; x < size; x++)
++            {
++                float radius = new Vector2((x + 0.5f) / size * 2f - 1f,
++                    (y + 0.5f) / size * 2f - 1f).magnitude;
++                float alpha = Mathf.Pow(Mathf.Clamp01(1f - radius), 1.6f);
++                pixels[y * size + x] = new Color(1f, 1f, 1f, alpha);
++            }
++        glowTexture.SetPixels(pixels);
++        glowTexture.Apply(false, true);
++        glowSprite = Sprite.Create(glowTexture, new Rect(0, 0, size, size), new Vector2(0.5f, 0.5f));
++        return glowSprite;
++    }
++
++    private Image CreateGlow(string name, Vector3 position, Vector2 size, Color color)
++    {
++        GameObject visual = new GameObject(name, typeof(RectTransform), typeof(Image));
++        visual.transform.SetParent(placedBlocksRoot, false);
++        Image image = visual.GetComponent<Image>();
++        image.raycastTarget = false;
++        image.sprite = GetGlowSprite();
++        image.color = color;
++        image.rectTransform.sizeDelta = size;
++        image.rectTransform.position = position;
++        glowVisuals.Add(image.rectTransform);
++        return image;
++    }
++
++    private void StartLineGlow(int firstIndex, int lastIndex, bool horizontal)
++    {
++        Vector3 first = gridCells[firstIndex].TransformPoint(gridCells[firstIndex].rect.center);
++        Vector3 last = gridCells[lastIndex].TransformPoint(gridCells[lastIndex].rect.center);
++        Vector3 localFirst = placedBlocksRoot.InverseTransformPoint(first);
++        Vector3 localLast = placedBlocksRoot.InverseTransformPoint(last);
++        Vector2 cellSize = gridCells[firstIndex].rect.size;
++        Vector2 size = horizontal
++            ? new Vector2(Mathf.Abs(localLast.x - localFirst.x) + cellSize.x, cellSize.y * 1.45f)
++            : new Vector2(cellSize.x * 1.45f, Mathf.Abs(localLast.y - localFirst.y) + cellSize.y);
++        Image halo = CreateGlow("LineHalo", (first + last) * 0.5f, size * 1.15f, lineGlowColor);
++        Image core = CreateGlow("LineFlash", (first + last) * 0.5f,
++            horizontal ? new Vector2(size.x, cellSize.y * 0.42f)
++                       : new Vector2(cellSize.x * 0.42f, size.y), Color.white);
++        Image sweep = CreateGlow("LineSweep", first, cellSize * 1.8f, Color.white);
++        activeClearAnimations++;
++        StartCoroutine(PlayLineGlow(halo, core, sweep, first, last, horizontal ? columns : rows));
++    }
++
++    private IEnumerator PlayLineGlow(Image halo, Image core, Image sweep,
++        Vector3 first, Vector3 last, int lineLength)
++    {
++        float elapsed = 0f;
++        float duration = Mathf.Max(0.01f, lineFlashDuration + clearDuration +
++            Mathf.Max(0f, (lineLength - 1) / 2f - 0.5f) * clearStagger);
++        while (halo != null && core != null && sweep != null && elapsed < duration)
++        {
++            elapsed += Time.unscaledDeltaTime;
++            float t = Mathf.Clamp01(elapsed / duration);
++            float flash = Mathf.Clamp01(elapsed / 0.055f) * (1f - t);
++            Color color = lineGlowColor;
++            color.a *= flash;
++            halo.color = color;
++            core.color = new Color(1f, 1f, 1f, flash);
++            sweep.color = new Color(1f, 1f, 1f, Mathf.Sin(t * Mathf.PI));
++            sweep.rectTransform.position = Vector3.Lerp(first, last, Mathf.SmoothStep(0f, 1f, t));
++            yield return null;
++        }
++        Image[] images = { halo, core, sweep };
++        foreach (Image image in images)
++            if (image != null)
++            {
++                glowVisuals.Remove(image.rectTransform);
++                Destroy(image.gameObject);
++            }
++        activeClearAnimations = Mathf.Max(0, activeClearAnimations - 1);
+     }
+ 
+     private float GetClearDelay(
+@@ -502,6 +774,30 @@
+ 
+         for (int i = 0; i < graphics.Length; i++)
+             originalColors[i] = graphics[i].color;
++
++        GameObject flashObject = new GameObject("CellFlash", typeof(RectTransform), typeof(Image));
++        flashObject.transform.SetParent(block, false);
++        Image flashOverlay = flashObject.GetComponent<Image>();
++        flashOverlay.raycastTarget = false;
++        flashOverlay.sprite = GetGlowSprite();
++        flashOverlay.rectTransform.anchorMin = Vector2.zero;
++        flashOverlay.rectTransform.anchorMax = Vector2.one;
++        flashOverlay.rectTransform.offsetMin = -block.rect.size * 0.35f;
++        flashOverlay.rectTransform.offsetMax = block.rect.size * 0.35f;
++        flashOverlay.color = new Color(1f, 1f, 1f, 0f);
++
++        // Every cell in the completed line lights together before the staggered disappearance.
++        float flashElapsed = 0f;
++        while (block != null && flashElapsed < lineFlashDuration)
++        {
++            flashElapsed += Time.unscaledDeltaTime;
++            float flash = Mathf.Clamp01(flashElapsed / 0.045f) * clearFlashStrength;
++            flashOverlay.color = new Color(1f, 1f, 1f, flash);
++            for (int i = 0; i < graphics.Length; i++)
++                if (graphics[i] != null)
++                    graphics[i].color = Color.Lerp(originalColors[i], Color.white, flash);
++            yield return null;
++        }
+ 
+         float delayElapsed = 0f;
+ 
+@@ -564,6 +860,8 @@
+ 
+             float flash = Mathf.Sin(time * Mathf.PI) *
+                           clearFlashStrength;
++            if (flashOverlay != null)
++                flashOverlay.color = new Color(1f, 1f, 1f, flash);
+ 
+             for (int i = 0; i < graphics.Length; i++)
+             {
+@@ -580,6 +878,7 @@
+             yield return null;
+         }
+ 
++        clearingBlocks.Remove(block);
+         if (block != null)
+             Destroy(block.gameObject);
+ 
+@@ -675,4 +974,39 @@
+         if (handle != null)
+             Destroy(handle);
+     }
++
++    private void OnDisable()
++    {
++        if (previewOwner != null)
++            previewOwner.CancelInteraction();
++        StopAllCoroutines();
++        foreach (RectTransform block in clearingBlocks)
++            if (block != null)
++                Destroy(block.gameObject);
++        clearingBlocks.Clear();
++        foreach (RectTransform glow in glowVisuals)
++            if (glow != null)
++                Destroy(glow.gameObject);
++        glowVisuals.Clear();
++        if (placedBlocks != null && gridCells != null)
++            for (int i = 0; i < placedBlocks.Length; i++)
++                if (occupiedCells[i] && placedBlocks[i] != null && gridCells[i] != null)
++                    PlaceCellVisual(placedBlocks[i], gridCells[i], i);
++        activeClearAnimations = 0;
++        activePlacementAnimations = 0;
++        resolutionCoroutine = null;
++    }
++
++    private void OnDestroy()
++    {
++        foreach (Image ghost in previewImages)
++            if (ghost != null)
++                Destroy(ghost.gameObject);
++        if (scoreDisplay != null)
++            Destroy(scoreDisplay.gameObject);
++        if (glowSprite != null)
++            Destroy(glowSprite);
++        if (glowTexture != null)
++            Destroy(glowTexture);
++    }
+ }
